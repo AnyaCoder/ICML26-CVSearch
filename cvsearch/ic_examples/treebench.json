@@ -1,0 +1,19 @@
+{
+    "question_template": "Question: {}\nIf you want to answer the question, which objects' information do you need?",
+    "question_list": [
+        "From the perspective of the statue in the center of the plaza, in which direction is the red telephone booth?",
+        "What color is the umbrella held by the woman in the blue coat?",
+        "From the perspective of the shop with the sign 'Bakery', is the white van on the left or right side of the street lamp?",
+        "In which direction is the green trash can relative to the bench with a sleeping cat?",
+        "Find the billboard with the text 'SALE' and tell me what is directly below it.",
+        "From the perspective of the man wearing a red helmet and riding a bike, where is the yellow taxi?"
+    ],
+    "response_list": [
+        "To answer the question, I need know the location of the statue in the center of the plaza and the red telephone booth so that I can determine the directional relationship from the statue's perspective. So I need the information about the following objects: statue in the center of the plaza and red telephone booth.",
+        "To answer the question, I need know the location of the woman in the blue coat holding an umbrella so that I can determine the color of the umbrella. So I need the information about the following objects: woman in the blue coat holding an umbrella.",
+        "To answer the question, I need know the location of the shop with the sign 'Bakery', the white van, and the street lamp so that I can determine the spatial relationship from the shop's perspective. So I need the information about the following objects: shop with the sign 'Bakery', white van, and street lamp.",
+        "To answer the question, I need know the location of the green trash can and the bench with a sleeping cat so that I can determine the relative direction. So I need the information about the following objects: green trash can and bench with a sleeping cat.",
+        "To answer the question, I need know the location of the billboard with the text 'SALE' so that I can identify the object below it. So I need the information about the following objects: billboard with the text 'SALE'.",
+        "To answer the question, I need know the location of the man wearing a red helmet and riding a bike and the yellow taxi so that I can determine the direction from the man's perspective. So I need the information about the following objects: man wearing a red helmet and riding a bike and yellow taxi."
+    ]
+}

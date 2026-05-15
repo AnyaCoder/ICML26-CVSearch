@@ -1,0 +1,21 @@
+{
+    "question_template": "Question: {}\nIf you want to answer the question, which objects' information do you need?",
+    "question_list": [
+        "What color is the tent on the right side of the road?",
+        "What is the color of the car parked behind the black car?",
+        "What color is the clothing of the person next to the red car?",
+        "What color is the suitcase held by the person in the blue down jacket?",
+        "What is the shape of the trash can placed on the overpass?",
+        "Which country's flag is the flag on the building below?",
+        "What color is the street sign on the street lamp?"
+    ],
+    "response_list": [
+        "To answer the question, I need know the location of the tent on the right side of the road so that I can determine its color. So I need the information about the following objects: tent on the right side of the road.",
+        "To answer the question, I need know the location of the car parked behind the black car so that I can determine its color. So I need the information about the following objects: car parked behind the black car.",
+        "To answer the question, I need know the location of the person next to the red car so that I can determine the color of their clothing. So I need the information about the following objects: person next to the red car.",
+        "To answer the question, I need know the location of the suitcase held by the person in the blue down jacket so that I can determine its color. So I need the information about the following objects: suitcase held by the person in the blue down jacket.",
+        "To answer the question, I need know the location of the trash can placed on the overpass so that I can determine its shape. So I need the information about the following objects: trash can placed on the overpass.",
+        "To answer the question, I need know the location of the flag on the building below so that I can determine which country it belongs to. So I need the information about the following objects: flag on the building below.",
+        "To answer the question, I need know the location of the street sign on the street lamp so that I can determine its color. So I need the information about the following objects: street sign on the street lamp."
+    ]
+}
