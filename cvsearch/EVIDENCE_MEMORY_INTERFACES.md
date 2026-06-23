@@ -14,6 +14,13 @@ Output: `EvidenceWindow`
 
 This component decides what local region VLM and LangSAM should observe for each proposal. The default can be a fixed observation window. The formal variant is attention-guided shrinking: use VLM internal attention inside the proposal crop to estimate where the target likely lies, then create a smaller LangSAM/VLM window with enough context.
 
+Implemented adapters live in `window_builders.py`:
+
+- `FixedWindowBuilder`
+- `AttentionGuidedWindowBuilder`
+
+Implementation details are documented in `WINDOW_BUILDER.md`.
+
 Main ablation axis:
 
 - fixed observation window
