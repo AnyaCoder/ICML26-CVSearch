@@ -49,6 +49,9 @@ if __name__ == "__main__":
                         choices=["vstar", "hr-bench_4k", "hr-bench_8k", "mme-realworld-lite", "treebench",
                                  "fines-bench_option", "fines-bench_reasoning"], default="hr-bench_4k")
     parser.add_argument("--direct-answer", action="store_true")
+    parser.add_argument("--enable-evidence-memory", action="store_true")
+    parser.add_argument("--dino-device", type=str, default="cuda:0")
+    parser.add_argument("--dino-local-files-only", action="store_true")
     args = parser.parse_args()
 
     model_path = os.path.join(args.root_path, args.model_path)
@@ -121,6 +124,55 @@ if __name__ == "__main__":
     sam3 = sam3_inference(model_path=os.path.join(args.root_path, args.sam_model_path))
     decomposed_question_template = "What is the appearance of the {}?"
 
+    # Evidence memory compiler (optional)
+    evidence_compiler = None
+    if args.enable_evidence_memory:
+        from cvsearch.evidence_memory import (
+            EvidenceMemoryCompiler,
+            AttentionGuidedWindowBuilder,
+            VerifierFirstEvidenceKeeper,
+            PerTargetEvidenceLayout,
+            WindowBuilderConfig,
+        )
+        from cvsearch.evidence_memory.qwen_attention_provider import (
+            QwenFilteredAttentionProvider,
+            QwenFilteredAttentionConfig,
+        )
+        from cvsearch.evidence_memory.keepers import (
+            GroundingDINOBoxVerifier,
+            AttentionBoxGrounder,
+            EvidenceRetentionConfig,
+        )
+
+        attn_provider = QwenFilteredAttentionProvider(
+            QwenFilteredAttentionConfig(
+                model_path=model_path,
+                device="cuda:0",
+                dtype=torch.bfloat16,
+            ),
+            external_model=search_model.model,
+            external_processor=search_model.processor,
+        )
+        dino_verifier = GroundingDINOBoxVerifier(
+            model_path="IDEA-Research/grounding-dino-base",
+            device=args.dino_device,
+            region="attention_box",
+            local_files_only=args.dino_local_files_only,
+        )
+        evidence_compiler = EvidenceMemoryCompiler(
+            window_builder=AttentionGuidedWindowBuilder(
+                attn_provider,
+                config=WindowBuilderConfig(),
+            ),
+            keeper=VerifierFirstEvidenceKeeper(
+                verifier=dino_verifier,
+                grounder=AttentionBoxGrounder(),
+                config=EvidenceRetentionConfig(max_items_per_target=3),
+            ),
+            layout=PerTargetEvidenceLayout(),
+        )
+        print("[EvidenceMemory] compiler built successfully")
+
     ic_examples_path = f"ic_examples/{benchmark}.json"
     if benchmark == "vstar" and "llava" in model_path.lower():
         m = json.load(
@@ -146,6 +198,7 @@ if __name__ == "__main__":
                 ic_examples=json.load(open(ic_examples_path, "r")),
                 decomposed_question_template=decomposed_question_template,
                 image_folder=os.path.join(annoataion_path, f"{benchmark}"),
+                evidence_compiler=evidence_compiler,
                 **search_kwargs,
             )
         else:
