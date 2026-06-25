@@ -283,11 +283,13 @@ def render_original_coordinate_merge(
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
     for item in items:
+        proposal_xyxy = xywh_to_int_xyxy(clip_box(item.proposal_box, base.size))
         window_xyxy = xywh_to_int_xyxy(clip_box(item.window_box, base.size))
         evidence_xyxy = xywh_to_int_xyxy(clip_box(item.evidence_box, base.size))
         canvas.paste(base.crop(window_xyxy), window_xyxy[:2])
-        draw.rectangle(window_xyxy, outline=(245, 200, 40), width=4)
-        draw.rectangle(evidence_xyxy, outline=(220, 30, 30), width=5)
+        draw.rectangle(proposal_xyxy, outline=(40, 120, 245), width=3)  # blue: searched_crop (proposal)
+        draw.rectangle(window_xyxy, outline=(245, 200, 40), width=4)    # yellow: attention window
+        draw.rectangle(evidence_xyxy, outline=(220, 30, 30), width=5)   # red: grounded evidence
         label = f"{item.target.phrase[:28]} {item.score:.2f}"
         label_x, label_y = evidence_xyxy[0] + 3, max(0, evidence_xyxy[1] - 16)
         text_box = draw.textbbox((label_x, label_y), label, font=font)
