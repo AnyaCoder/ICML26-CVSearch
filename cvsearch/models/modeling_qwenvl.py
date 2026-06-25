@@ -4,6 +4,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 from .tree import Node, NodeA
 from .utils import *
+from cvsearch.utils import release_cuda_cache
 BOX_COLOR = "red"
 
 class ModelQwenVL:
@@ -16,9 +17,9 @@ class ModelQwenVL:
             device_map = "auto"
         else:
             device_map = self.device
-        self.use_flash_attn = True
-        actual_attn_implementation = "flash_attention_2" if self.use_flash_attn else None
-        print(f"Flash Attention Enabled: {self.use_flash_attn} (Backend: {actual_attn_implementation})")
+        self.use_flash_attn = False
+        actual_attn_implementation = "sdpa"
+        print(f"Attention Implementation: {actual_attn_implementation}")
         ###Qwen2.5-VL
         if 'Qwen2.5' in model_path:
             self.processor = AutoProcessor.from_pretrained(model_path)
@@ -125,6 +126,8 @@ class ModelQwenVL:
             out_ids[len(in_ids):] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
         ]
         response = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True,clean_up_tokenization_spaces=False)[0]
+        del generated_ids, generated_ids_trimmed, model_inputs
+        release_cuda_cache(self.device)
 
         targets_sentence = extract_targets_SGVS(response)
         if targets_sentence is not None:
@@ -333,8 +336,10 @@ class ModelQwenVL:
         )
         model_inputs = model_inputs.to(self.device)
         outputs = self.model(**model_inputs)
-
-        return self._cal_confidence(outputs)
+        confidence = self._cal_confidence(outputs)
+        del outputs, model_inputs
+        release_cuda_cache(self.device)
+        return confidence
 
     @torch.no_grad()
     def _cal_confidence(self, outputs):
@@ -374,6 +379,8 @@ class ModelQwenVL:
             out_ids[len(in_ids):] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)
         ]
         outputs = self.processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True,clean_up_tokenization_spaces=False)[0]
+        del generated_ids, generated_ids_trimmed, model_inputs
+        release_cuda_cache(self.device)
 
         if return_zoomed_view:
             response = {'text': outputs, 'output_image': image_list[1] if len(image_list) > 1 else image_list[0]}
@@ -411,6 +418,8 @@ class ModelQwenVL:
         len_question_input_ids = question_input_ids.shape[1]
         output_question = self.model(**model_inputs)
         len_question_logits = output_question.logits.shape[1]
+        del output_question, model_inputs, question_input_ids
+        release_cuda_cache(self.device)
 
         loss_list = []
         for option in options:
@@ -434,9 +443,12 @@ class ModelQwenVL:
             labels = full_input_ids[:, len_question_input_ids:].view(-1)
 
             loss = loss_fct(logits, labels)
-            loss_list.append(loss)
+            loss_list.append(loss.detach().cpu())
+            del output_option, full_model_inputs, full_input_ids, logits, labels, loss
+            release_cuda_cache(self.device)
 
         option_chosen = torch.stack(loss_list).argmin()
-        return option_chosen.cpu().item()
-
-
+        answer = option_chosen.cpu().item()
+        del loss_list, option_chosen
+        release_cuda_cache(self.device)
+        return answer

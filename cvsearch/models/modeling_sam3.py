@@ -8,6 +8,7 @@ import math
 from PIL import Image, ImageDraw
 import time
 import matplotlib.patches as patches
+from cvsearch.utils import release_cuda_cache
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.train.transforms.basic_for_api import ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI
@@ -27,8 +28,6 @@ try:
     from skimage import graph
 except ImportError:
     from skimage.future import graph
-import gc
-
 class sam3_inference():
     def __init__(self, model_path):
         self.model = build_sam3_image_model(checkpoint_path=model_path)
@@ -158,7 +157,7 @@ def _calc_complexity_effective_rank(features):
 
 class ConstrainedTreeBuilder:
     def __init__(self, feature_map, n_atoms=400, pos_weight=2.0, split_threshold=0.3, keep_threshold=0.05, lazy_base=0.4, lazy_bonus=0.6, decay_factor=0.95, use_local_normalization=True,
-                 use_silhouette_score=True):
+                 use_silhouette_score=True, atom_feature_components=16, atom_compactness=1.0, atom_sigma=0.6):
         if isinstance(feature_map, torch.Tensor):
             self.feat = feature_map.detach().cpu().numpy()
         else:
@@ -174,15 +173,21 @@ class ConstrainedTreeBuilder:
         self.decay_factor = decay_factor
         self.use_local_normalization = use_local_normalization
         self.use_silhouette_score = use_silhouette_score
+        self.atom_feature_components = atom_feature_components
+        self.atom_compactness = atom_compactness
+        self.atom_sigma = atom_sigma
         self.node_registry = {}
+        self._feature_slic_volume_cache = None
         self.atom_labels, self.atom_features, self.atom_bboxes, self.adj_matrix = self._generate_atoms_and_graph()
 
     def _generate_atoms_and_graph(self):
-        feat_tr = self.feat.transpose(1, 2, 0)
-        feat_min, feat_max = feat_tr.min(), feat_tr.max()
-        feat_norm = (feat_tr - feat_min) / (feat_max - feat_min + 1e-6)
-        #SLIC
-        atom_map = slic(feat_norm, n_segments=self.n_atoms, compactness=20, start_label=0, channel_axis=2)
+        feat_tr = np.nan_to_num(self.feat.transpose(1, 2, 0).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        slic_volume = self._feature_slic_volume(feat_tr)
+        atom_map = self.feature_slic_labels(
+            n_segments=self.n_atoms,
+            compactness=self.atom_compactness,
+            sigma=self.atom_sigma,
+        )
         unique_labels = np.unique(atom_map)
         n_actual = len(unique_labels)
         semantic_features = np.zeros((n_actual, self.C), dtype=np.float32)
@@ -206,12 +211,72 @@ class ConstrainedTreeBuilder:
         final_features = np.concatenate([semantic_features, spatial_features], axis=1)
 
         # --- Construct adjacency matrix ---
-        rag_img = feat_tr[:, :, :3] if self.C >= 3 else feat_tr
+        rag_img = slic_volume[:, :, :3] if slic_volume.shape[2] >= 3 else slic_volume
         rag = graph.rag_mean_color(rag_img, atom_map, mode='distance')
 
         # Convert to Sparse Matrix (N_atoms, N_atoms)
         adj_matrix = nx.adjacency_matrix(rag)
         return atom_map, final_features, np.array(atom_bboxes), adj_matrix
+
+    def _feature_slic_volume(self, feat_tr):
+        if self._feature_slic_volume_cache is not None:
+            return self._feature_slic_volume_cache
+        flat = feat_tr.reshape(-1, self.C)
+        flat = StandardScaler().fit_transform(flat)
+        n_components = min(int(self.atom_feature_components), self.C, flat.shape[0])
+        if 0 < n_components < self.C:
+            try:
+                flat = PCA(n_components=n_components, svd_solver="randomized", random_state=0).fit_transform(flat)
+            except (ValueError, np.linalg.LinAlgError):
+                flat = flat[:, :n_components]
+        lo = np.percentile(flat, 1, axis=0, keepdims=True)
+        hi = np.percentile(flat, 99, axis=0, keepdims=True)
+        flat = (flat - lo) / (hi - lo + 1e-6)
+        flat = np.clip(flat, 0.0, 1.0)
+        self._feature_slic_volume_cache = flat.reshape(self.H, self.W, -1).astype(np.float32)
+        return self._feature_slic_volume_cache
+
+    def feature_slic_labels(self, n_segments=None, compactness=None, sigma=None):
+        feat_tr = np.nan_to_num(self.feat.transpose(1, 2, 0).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        slic_volume = self._feature_slic_volume(feat_tr)
+        return slic(
+            slic_volume,
+            n_segments=int(n_segments or self.n_atoms),
+            compactness=float(self.atom_compactness if compactness is None else compactness),
+            sigma=float(self.atom_sigma if sigma is None else sigma),
+            start_label=0,
+            channel_axis=2,
+            convert2lab=False,
+        )
+
+    def evidence_superpixel_labels(self):
+        n_segments = max(64, min(int(self.n_atoms), int(round(self.n_atoms * 0.3))))
+        return self.feature_slic_labels(
+            n_segments=n_segments,
+            compactness=0.03,
+            sigma=self.atom_sigma,
+        )
+
+    def semantic_features_for_labels(self, labels):
+        labels = np.asarray(labels, dtype=np.int32)
+        if labels.ndim != 2 or labels.size == 0:
+            return np.zeros((0, self.C), dtype=np.float32)
+        valid = labels >= 0
+        if not bool(valid.any()):
+            return np.zeros((0, self.C), dtype=np.float32)
+        max_label = int(labels[valid].max())
+        flat_labels = labels.reshape(-1)
+        flat_valid = valid.reshape(-1)
+        feat = self.feat.transpose(1, 2, 0).reshape(-1, self.C).astype(np.float32)
+        counts = np.bincount(flat_labels[flat_valid], minlength=max_label + 1).astype(np.float32)
+        features = np.zeros((max_label + 1, self.C), dtype=np.float32)
+        for channel in range(self.C):
+            features[:, channel] = np.bincount(
+                flat_labels[flat_valid],
+                weights=feat[flat_valid, channel],
+                minlength=max_label + 1,
+            )
+        return features / np.maximum(counts[:, None], 1.0)
 
     def _calc_overlap_cost(self, child_nodes):
         if len(child_nodes) < 2: return 0.0
@@ -1127,8 +1192,7 @@ if __name__ == "__main__":
     feat = feat.squeeze(0)  # batch -> (256, 72, 72), C,H,W
     del backbone_out
     del image_features_batch
-    gc.collect()
-    torch.cuda.empty_cache()
+    release_cuda_cache()
     print("GPU memory cleared after 1st inference.")
     #### Building a semantic tree
     tree_depth = 3
@@ -1180,9 +1244,7 @@ if __name__ == "__main__":
 
         del backbone_out_sub
         del image_features_batch_sub
-
-        gc.collect()
-        torch.cuda.empty_cache()
+        release_cuda_cache()
         print("GPU memory cleared after 1st inference.")
 
         tree_depth_sub = 2
@@ -1258,9 +1320,6 @@ if __name__ == "__main__":
     # visualizer.visualize_subtrees_individually(tree, img_shape=(72, 72))
     # ### raw image crop ###
     # visualizer.visualize_hierarchy()
-
-
-
 
 
 

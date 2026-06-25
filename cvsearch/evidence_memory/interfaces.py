@@ -57,7 +57,8 @@ class EvidenceItem:
     score: float
     vlm_score: float | None = None
     grounding_score: float | None = None
-    refinement: Literal["grounded", "fallback", "none"] = "none"
+    attention_shift: float | None = None
+    refinement: Literal["grounded", "none"] = "none"
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -65,8 +66,9 @@ class EvidenceItem:
 class MontageArtifact:
     """The compact visual state shown to the final VLM or downstream search."""
 
-    mode: Literal["nodes", "grid", "relation", "compressed_relation"]
+    mode: Literal["nodes", "grid", "relation", "original_merge", "compact_evidence"]
     image_path: str | None = None
+    model_input_path: str | None = None
     boxes_by_target: Mapping[str, Sequence[BoxXYWH]] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -93,7 +95,7 @@ class EvidenceLayoutArtifact:
 
 
 class WindowBuilder(Protocol):
-    """Target-Aware Windowing: convert proposals into VLM/LangSAM windows."""
+    """Target-Aware Windowing: convert proposals into target-conditioned windows."""
 
     name: str
 
@@ -110,7 +112,7 @@ class WindowBuilder(Protocol):
 
 
 class EvidenceKeeper(Protocol):
-    """VLM-Gated Evidence Retention: verify, refine, score, and keep evidence."""
+    """Evidence Retention: verify, refine, score, and keep evidence."""
 
     name: str
 

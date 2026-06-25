@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+
+/datasets/
+/debug/
+/logs/
+*.pdf
+
+# IDE & editor
+.idea/
+.vscode/
+.claude/
+
+# Eval outputs
+cvsearch/CVsearch/
+cvsearch/datasets
+
+# Models & cache (top-level binary model files only)
+/models/
+.cache/

@@ -1,11 +1,7 @@
-from models.modeling_llava import Model, ModelLocal, ModelGlobalLocal
-from models.modeling_llava import BOX_COLOR as BOX_COLOR_LLAVA
-from models.modeling_internvl import BOX_COLOR as BOX_COLOR_INTERNVL
-from models.modeling_qwenvl import BOX_COLOR as BOX_COLOR_QWENVL
 from models.tree import ImageTree, Node, NodeState, AdaptiveImageTree, NodeA
 from models.utils import include_pronouns, load_json_or_jsonl, extract_visual_objects, normalize_target_text
 from models.modeling_sam3 import ConstrainedTreeBuilder
-from typing import Union, Callable, List, Tuple
+from typing import Callable, List, Tuple, Union
 from PIL import Image
 from copy import deepcopy
 import os
@@ -14,7 +10,7 @@ import torch
 
 def get_cvsearch_response(
         sam_model,
-        zoom_model: Model,
+        zoom_model,
         nlp_model,
         annotation,
         ic_examples,
@@ -27,6 +23,8 @@ def get_cvsearch_response(
         image_folder: str = None,
         search_mode=True,
         enable_parent_verification=False,
+        debug_recorder=None,
+        evidence_compiler=None,
 ):
     # Data loading
     #Default single_target: tree_depth_s = 2, cross_target: tree_depth_c = 3
@@ -40,6 +38,8 @@ def get_cvsearch_response(
     if image_folder is not None:
         input_image = os.path.join(image_folder, input_image)
     image_pil = Image.open(input_image).convert('RGB')
+    if debug_recorder is not None:
+        debug_recorder.start_sample(annotation, image_pil, input_image)
     question = annotation['question']
     options = annotation.get('options', None)
     question_free_form = None
@@ -52,6 +52,8 @@ def get_cvsearch_response(
     root_node.search_source = "global"
     root_ans_conf = zoom_model.get_confidence_value([root_node], image_pil, confidence_type='answering',input_ele=question)
     annotation['root_ans_conf'] = root_ans_conf
+    if debug_recorder is not None:
+        debug_recorder.record_root_confidence(root_ans_conf)
     annotation['sam'] = []
     if root_ans_conf>answering_confidence_threshold_lower+fast_threshold:
         #####Quick Answer########
@@ -99,6 +101,16 @@ def get_cvsearch_response(
 
         ####sam3 result -> bbox
         sam_success_flags, sam_bboxes = process_sam_result(processed_results, target_id, is_search_second)
+        if debug_recorder is not None:
+            debug_recorder.record_sam(
+                "primary_sam",
+                image_pil,
+                text_target,
+                processed_results,
+                target_id,
+                sam_success_flags,
+                sam_bboxes,
+            )
 
         # Adaptive visual search
         if target_sign:
@@ -146,6 +158,9 @@ def get_cvsearch_response(
                 tree_dict = builder.build_tree(max_depth=tree_depth, min_splits=4, max_splits=8)
                 feat_shape = feat.shape
                 image_tree = AdaptiveImageTree(image_pil, tree_dict, feat_shape)
+                if debug_recorder is not None:
+                    debug_recorder.record_tree("primary_tree", image_tree)
+                    debug_recorder.record_tree_boundaries("primary_tree", image_pil, builder, tree_dict)
                 num_pop = []
                 for flag, search_box, t_target in zip(sam_success_flags, sam_bboxes, text_target):
                     if flag==1:
@@ -175,6 +190,8 @@ def get_cvsearch_response(
                             image_tree=image_tree,
                             enable_parent_verification=enable_parent_verification,
                             prior_pruning_threshold=tree_prune_threshold,
+                            debug_recorder=debug_recorder,
+                            debug_label=f"primary_{t_target}",
                         )
                         num_pop.append(num_pop_search)
                         if is_success:
@@ -198,6 +215,8 @@ def get_cvsearch_response(
                                     cropped_image, cropped_bbox = crop_image_by_node(image_pil, best_candidate)
                                     if cropped_image:
                                         left, top = cropped_bbox[0], cropped_bbox[1]
+                                        if debug_recorder is not None:
+                                            debug_recorder.record_second_crop(f"second_{t_target}", image_pil, cropped_bbox, t_target)
                                         with torch.inference_mode():
                                             backbone_out_sub, processed_results_sub, target_id_sub = sam_model.batch_inference(cropped_image, [t_target])
                                         image_features_batch_sub = backbone_out_sub['vision_features']
@@ -210,6 +229,17 @@ def get_cvsearch_response(
                                         del image_features_batch_sub
 
                                         sam_success_flags_sub, sam_bboxes_sub = process_sam_result(processed_results_sub, target_id_sub, is_search_second)
+                                        if debug_recorder is not None:
+                                            debug_recorder.record_sam(
+                                                f"second_sam_{t_target}",
+                                                cropped_image,
+                                                [t_target],
+                                                processed_results_sub,
+                                                target_id_sub,
+                                                sam_success_flags_sub,
+                                                sam_bboxes_sub,
+                                                offset=(left, top),
+                                            )
                                         if sum(sam_success_flags_sub) == len([t_target]):
                                             # second sam3 inference successfully segmented target objects
                                             fast_node = []
@@ -234,8 +264,11 @@ def get_cvsearch_response(
                                                                                  use_local_normalization=True,
                                                                                  use_silhouette_score=True)
                                             tree_sub = builder_sub.build_tree(max_depth=tree_depth_sub, min_splits=4, max_splits=8)
-                                            feat_shape = feat.shape
-                                            image_tree_sub = AdaptiveImageTree(cropped_image, tree_sub, feat_shape)
+                                            feat_shape_sub = feat_sub.shape
+                                            image_tree_sub = AdaptiveImageTree(cropped_image, tree_sub, feat_shape_sub)
+                                            if debug_recorder is not None:
+                                                debug_recorder.record_tree(f"second_tree_{t_target}", image_tree_sub)
+                                                debug_recorder.record_tree_boundaries(f"second_tree_{t_target}", cropped_image, builder_sub, tree_sub)
                                             candidates_search_sub, num_pop_search_sub, is_success_sub = semantic_guide_search_dynamic_depth(
                                                 zoom_model=zoom_model,
                                                 pop_limit=pop_limit,
@@ -250,6 +283,8 @@ def get_cvsearch_response(
                                                 image_tree=image_tree_sub,
                                                 enable_parent_verification=enable_parent_verification,
                                                 prior_pruning_threshold=tree_prune_threshold,
+                                                debug_recorder=debug_recorder,
+                                                debug_label=f"second_{t_target}",
                                             )
 
                                             if is_success_sub:
@@ -321,6 +356,9 @@ def get_cvsearch_response(
                 tree_dict = builder.build_tree(max_depth=tree_depth, min_splits=4, max_splits=8)
                 feat_shape = feat.shape
                 image_tree = AdaptiveImageTree(image_pil, tree_dict, feat_shape)
+                if debug_recorder is not None:
+                    debug_recorder.record_tree("primary_tree", image_tree)
+                    debug_recorder.record_tree_boundaries("primary_tree", image_pil, builder, tree_dict)
                 num_pop = []
                 for flag, search_box, t_target in zip(sam_success_flags, sam_bboxes, text_target):
                     if flag==1:
@@ -349,6 +387,8 @@ def get_cvsearch_response(
                             image_tree=image_tree,
                             enable_parent_verification=enable_parent_verification,
                             prior_pruning_threshold=tree_prune_threshold,
+                            debug_recorder=debug_recorder,
+                            debug_label=f"primary_{t_target}",
                         )
                         num_pop.append(num_pop_search)
                         if is_success:
@@ -367,6 +407,8 @@ def get_cvsearch_response(
                                     cropped_image, cropped_bbox = crop_image_by_node(image_pil, best_candidate)
                                     if cropped_image:
                                         left, top = cropped_bbox[0], cropped_bbox[1]
+                                        if debug_recorder is not None:
+                                            debug_recorder.record_second_crop(f"second_{t_target}", image_pil, cropped_bbox, t_target)
                                         with torch.inference_mode():
                                             backbone_out_sub, processed_results_sub, target_id_sub = sam_model.batch_inference(
                                                 cropped_image, [t_target])
@@ -381,6 +423,17 @@ def get_cvsearch_response(
 
                                         sam_success_flags_sub, sam_bboxes_sub = process_sam_result(
                                             processed_results_sub, target_id_sub, is_search_second)
+                                        if debug_recorder is not None:
+                                            debug_recorder.record_sam(
+                                                f"second_sam_{t_target}",
+                                                cropped_image,
+                                                [t_target],
+                                                processed_results_sub,
+                                                target_id_sub,
+                                                sam_success_flags_sub,
+                                                sam_bboxes_sub,
+                                                offset=(left, top),
+                                            )
                                         if sum(sam_success_flags_sub) == len([t_target]):
                                             fast_node = []
                                             for search_box in sam_bboxes_sub:
@@ -405,8 +458,11 @@ def get_cvsearch_response(
                                                                                  use_silhouette_score=True)
                                             tree_sub = builder_sub.build_tree(max_depth=tree_depth_sub,
                                                                               min_splits=4, max_splits=8)
-                                            feat_shape = feat.shape
-                                            image_tree_sub = AdaptiveImageTree(cropped_image, tree_sub, feat_shape)
+                                            feat_shape_sub = feat_sub.shape
+                                            image_tree_sub = AdaptiveImageTree(cropped_image, tree_sub, feat_shape_sub)
+                                            if debug_recorder is not None:
+                                                debug_recorder.record_tree(f"second_tree_{t_target}", image_tree_sub)
+                                                debug_recorder.record_tree_boundaries(f"second_tree_{t_target}", cropped_image, builder_sub, tree_sub)
                                             candidates_search_sub, num_pop_search_sub, is_success_sub = semantic_guide_search_dynamic_depth(
                                                 zoom_model=zoom_model,
                                                 pop_limit=pop_limit,
@@ -421,6 +477,8 @@ def get_cvsearch_response(
                                                 image_tree=image_tree_sub,
                                                 enable_parent_verification=enable_parent_verification,
                                                 prior_pruning_threshold=tree_prune_threshold,
+                                                debug_recorder=debug_recorder,
+                                                debug_label=f"second_{t_target}",
                                             )
 
                                             if is_success_sub:
@@ -431,7 +489,7 @@ def get_cvsearch_response(
                                                 state = NodeState(image_pil, bbox_shifted)
                                                 node = NodeA(state)
                                                 node.search_source = "fine"
-                                                zoom_node.append(NodeA(state))
+                                                zoom_node.append(node)
                                                 # print("Second Fine Search Success!")
                                             else:
                                                 best_candidate.search_source = "fine_fallback"
@@ -450,35 +508,135 @@ def get_cvsearch_response(
                     annotation['search_mode'] = 3
 
     annotation['searched_bbox'] = [node.state.bbox for node in searched_nodes]
+
+    # Evidence memory: compile searched_nodes into montage for enhanced answering
+    evidence_image = None
+    if evidence_compiler is not None and searched_nodes:
+        print(f"[EvidenceMemory] compiler present, {len(searched_nodes)} nodes, calling _compile_evidence...")
+        try:
+            evidence_image = _compile_evidence(
+                evidence_compiler, image_pil, question, searched_nodes, annotation, debug_recorder
+            )
+            print(f"[EvidenceMemory] result: {'montage loaded' if evidence_image else 'None (no montage)'}")
+        except Exception as e:
+            import traceback
+            print(f"[EvidenceMemory] compile failed: {e}")
+            traceback.print_exc()
+            evidence_image = None
+    elif evidence_compiler is None:
+        print("[EvidenceMemory] evidence_compiler is None, skipping")
+    else:
+        print("[EvidenceMemory] no searched_nodes, skipping")
+
+    # Use evidence montage if available, otherwise original image
+    final_image = evidence_image if evidence_image is not None else image_pil
+    final_nodes = [] if evidence_image is not None else searched_nodes
+
     answer_type = annotation.get('answer_type', 'free_form')
     # For vstar
     if answer_type == "logits_match":
-        option_choose = zoom_model.multiple_choices_inference(image_pil, question, options, searched_nodes)
+        option_choose = zoom_model.multiple_choices_inference(final_image, question, options, final_nodes)
+        if debug_recorder is not None:
+            debug_recorder.record_final(annotation, image_pil, searched_nodes, option_choose)
         return option_choose
     elif answer_type == "free_form":
         if question_free_form:
-            response = zoom_model.free_form_using_nodes(image_pil, question_free_form, searched_nodes)
+            response = zoom_model.free_form_using_nodes(final_image, question_free_form, final_nodes)
         else:
-            response = zoom_model.free_form_using_nodes(image_pil, question, searched_nodes)
+            response = zoom_model.free_form_using_nodes(final_image, question, final_nodes)
+        if debug_recorder is not None:
+            debug_recorder.record_final(annotation, image_pil, searched_nodes, response)
         return response
     # For hr-bench
     elif answer_type == "option_list":
         answers = []
         for option_str in options:
             question_input = format_question(question, option_str)
-            answers.append(zoom_model.free_form_using_nodes(image_pil, question_input, searched_nodes))
+            answers.append(zoom_model.free_form_using_nodes(final_image, question_input, final_nodes))
+        if debug_recorder is not None:
+            debug_recorder.record_final(annotation, image_pil, searched_nodes, answers)
         return answers
     # For mme-realworld
     elif answer_type == "Multiple Choice":
         question_input = format_question_multichoice(question, options)
-        response = zoom_model.free_form_using_nodes(image_pil, question_input, searched_nodes)
+        response = zoom_model.free_form_using_nodes(final_image, question_input, final_nodes)
+        if debug_recorder is not None:
+            debug_recorder.record_final(annotation, image_pil, searched_nodes, response)
         return response
     elif answer_type == "option_single":
         question_input = format_question_new(question, options)
-        response = zoom_model.free_form_using_nodes(image_pil, question_input, searched_nodes)
+        response = zoom_model.free_form_using_nodes(final_image, question_input, final_nodes)
+        if debug_recorder is not None:
+            debug_recorder.record_final(annotation, image_pil, searched_nodes, response)
         return response
     else:
         raise NotImplementedError
+
+
+def _compile_evidence(evidence_compiler, image_pil, question, searched_nodes, annotation, debug_recorder):
+    """Build evidence proposals from searched_nodes and compile via evidence_compiler."""
+    from cvsearch.evidence_memory import EvidenceProposal, TargetSpec
+
+    # Build targets from annotation
+    targets_text = annotation.get('targets', []) or []
+    targets = [TargetSpec(target_id=f"target_{i}", phrase=t) for i, t in enumerate(targets_text)]
+    if not targets:
+        targets = [TargetSpec(target_id="target_0", phrase="target")]
+
+    # Convert searched_nodes to EvidenceProposals
+    proposals = []
+    for index, node in enumerate(searched_nodes):
+        if getattr(node, "is_root", False):
+            continue
+        target = targets[min(index, len(targets) - 1)]
+        proposals.append(
+            EvidenceProposal(
+                target=target,
+                source_name=getattr(node, "search_source", "cvsearch"),
+                source_id=f"searched_{index:02d}_{getattr(node, 'id', index)}",
+                box=tuple(float(v) for v in node.state.bbox),
+                score=float(getattr(node, "answering_confidence", getattr(node, "posterior_score", 0.0)) or 0.0),
+                metadata={
+                    "node_id": getattr(node, "id", None),
+                    "depth": getattr(node, "depth", None),
+                    "search_source": getattr(node, "search_source", None),
+                },
+            )
+        )
+
+    if not proposals:
+        return None
+
+    # Build context with debug info
+    context = {"question": question, "annotation": annotation}
+    if debug_recorder is not None:
+        sample_dir = getattr(debug_recorder, "sample_dir", None) or getattr(debug_recorder, "output_dir", None)
+        if sample_dir:
+            from pathlib import Path as _Path
+            from cvsearch.debug.artifacts import ArtifactStore
+            sample_dir = _Path(sample_dir)
+            context["artifact_store"] = ArtifactStore(sample_dir)
+            context["evidence_montage_path"] = str(sample_dir / "12_evidence_memory_montage.jpg")
+            context["evidence_model_input_path"] = str(sample_dir / "12_evidence_model_input.jpg")
+
+    # Compile
+    artifact = evidence_compiler.compile(
+        image_pil,
+        question,
+        proposals=proposals,
+        targets=targets,
+        context=context,
+    )
+
+    # Load montage image if available
+    if artifact.montage and artifact.montage.model_input_path:
+        montage_path = artifact.montage.model_input_path
+        try:
+            return Image.open(montage_path).convert("RGB")
+        except Exception:
+            pass
+
+    return None
 
 
 def process_sam_result(processed_results, target_id, is_second_search):
@@ -587,7 +745,9 @@ def semantic_guide_search_dynamic_depth(
         prior_pruning_threshold: float = 0.4,
         parent_verification_threshold: float = 0.0,
         high_confidence_bypass: float = 0.8,
-        enable_parent_verification: bool = True
+        enable_parent_verification: bool = True,
+        debug_recorder=None,
+        debug_label=None,
 ) -> Tuple[List, int, bool]:
     # -------------------------------------------------------------------------
     # 0. Initialization and dynamic depth detection
@@ -612,6 +772,9 @@ def semantic_guide_search_dynamic_depth(
             queue.extend(node.children)
 
     total_pop = 0
+    debug_trace_id = None
+    if debug_recorder is not None:
+        debug_trace_id = debug_recorder.start_search(debug_label or visual_cue, visual_cue, question, image_pil)
 
     # -------------------------------------------------------------------------
     # Helper Functions
@@ -680,6 +843,8 @@ def semantic_guide_search_dynamic_depth(
             ans_conf = zoom_model.get_confidence_value([cur_node], image_pil, confidence_type='answering', input_ele=question)
             cur_node.answering_confidence = ans_conf
             pop_trace.append(cur_node)
+            if debug_recorder is not None:
+                debug_recorder.record_search_step(debug_trace_id, stage_name, cur_node, ans_conf, current_threshold)
             # print(f"[{stage_name}] ID:{cur_node.id} | Ans:{ans_conf:.4f}")
 
             if ans_conf >= current_threshold:
@@ -752,6 +917,8 @@ def semantic_guide_search_dynamic_depth(
 
         total_pop += count
         if success:
+            if debug_recorder is not None:
+                debug_recorder.finish_search(debug_trace_id, True, res)
             return res, total_pop, True
 
     # -------------------------------------------------------------------------
@@ -765,18 +932,26 @@ def semantic_guide_search_dynamic_depth(
             total_pop += 1
             ans_conf = zoom_model.get_confidence_value([target], image_pil, confidence_type='answering',input_ele=question)
             target.answering_confidence = ans_conf
+            if debug_recorder is not None:
+                debug_recorder.record_search_step(debug_trace_id, "Depth 1", target, ans_conf, answering_confidence_threshold_lower)
             # print(f"[Depth 1] Best Node {target.id} | Ans: {ans_conf:.4f}")
             if ans_conf >= answering_confidence_threshold_lower:
+                if debug_recorder is not None:
+                    debug_recorder.finish_search(debug_trace_id, True, [target])
                 return [target], total_pop, True
 
         all_d1 = sorted(nodes_by_depth[1], key=lambda x: getattr(x, 'posterior_score', -1), reverse=True)
+        if debug_recorder is not None:
+            debug_recorder.finish_search(debug_trace_id, False, all_d1[:1])
         return all_d1, total_pop, False
 
+    if debug_recorder is not None:
+        debug_recorder.finish_search(debug_trace_id, False, [])
     return [], total_pop, False
 
 
 def get_direct_response(
-        zoom_model: Model,
+        zoom_model,
         annotation,
         image_folder
 ):
@@ -814,6 +989,3 @@ def get_direct_response(
         return response
     else:
         raise NotImplementedError
-
-
-
