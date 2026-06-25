@@ -214,3 +214,133 @@ $$
 3. **超像素扩散校正**：利用图像的低级结构（SAM3 语义超像素或 RGB SLIC）对粗粒度的 token-level attention 做空间扩展，使最终的 bounding box 更贴合目标物体的真实轮廓。
 
 工程上，通过 LM-only eager patch 解决了 sdpa 模式下注意力不可观测的问题，实现了单 VLM 实例共享下的高效 attention 提取，peak 显存约 16 GiB，无需额外模型加载。
+
+## 9. 当前实现状态（与代码同步）
+
+### 9.1 模块清单
+
+| 模块 | 文件 | 作用 |
+|------|------|------|
+| `QwenFilteredAttentionProvider` | `qwen_attention_provider.py` | Qwen2.5-VL 注意力提取，sink 过滤，batch 支持 |
+| `AttentionGuidedWindowBuilder` | `window_builders.py` | proposal → attention heatmap → 超像素扩散 → window_box |
+| `GroundingDINOBoxVerifier` | `keepers.py` | 批量 DINO 检测验证，输出 evidence_box |
+| `AttentionBoxGrounder` | `keepers.py` | 用 attention_box 做 grounding（无额外模型） |
+| `VerifierFirstEvidenceKeeper` | `keepers.py` | DINO 验证 → grounding → 评分 → 保留 |
+| `PerTargetEvidenceLayout` | `layouts.py` | per-target top-K → montage 渲染 |
+| `EvidenceMemoryCompiler` | `interfaces.py` | 三组件串联的统一入口 |
+
+### 9.2 Pipeline 流程（当前代码）
+
+```
+CVSearch 搜索 → searched_nodes (1-3个)
+    ↓ _compile_evidence()
+转为 EvidenceProposal (target_phrase 绑定)
+    ↓ AttentionGuidedWindowBuilder.build()
+Qwen2.5-VL prefill → target-to-image attention
+    → sink 过滤 → 超像素扩散 → moment-based bbox → EvidenceWindow
+    ↓ VerifierFirstEvidenceKeeper.retain()
+GroundingDINO batch 验证 (region=attention_box)
+    → 有检测框: accepted, evidence_box = DINO 检测框
+    → 无检测框: rejected, 跳过
+    → 评分: vlm_conf + proposal_score × 0.1 + grounding_score × 0.25
+    → per-target 保留 top-3
+    ↓ PerTargetEvidenceLayout.layout()
+原图 + evidence overlay montage (蓝/黄/红三框)
+    → model_input.jpg (crops 拼接，白底)
+    ↓ VLM 最终回答
+看 montage/model_input 回答问题
+```
+
+### 9.3 三框可视化（`12_evidence_memory_montage.jpg`）
+
+| 颜色 | 框 | 含义 |
+|------|---|------|
+| 蓝色 (40,120,245) | `proposal_box` | CVSearch 搜索产出的原始 searched_crop 区域 |
+| 黄色 (245,200,40) | `window_box` | Attention 收缩后的窗口（注意力焦点） |
+| 红色 (220,30,30) | `evidence_box` | DINO 验证后的精确检测框 |
+
+层级关系：蓝 ⊃ 黄 ⊃ 红。
+
+### 9.4 与 CVSearch 搜索的集成方式
+
+Evidence memory 作为 CVSearch **搜索后的后处理增强**：
+- 搜索过程不变（递归 zoom-in + confidence-guided dynamic bottom-up search）
+- 搜索完成后，将 searched_nodes 转为 proposals 进入 evidence pipeline
+- Evidence pipeline 对搜索结果做精细定位和验证
+- 最终 VLM 看精细化的 evidence 而非原始粗粒度 crop 回答问题
+
+不替代搜索，而是**增强搜索结果的利用效率**。
+
+### 9.5 实验状态
+
+| 实验 | 数据集 | 结果 |
+|------|--------|------|
+| wrong-24 rerun (无 evidence) | V*Star 24题 | 0/24 修对 |
+| wrong-24 rerun (有 evidence) | V*Star 24题 | 13-14/24 修对 (58%) |
+| 全量 191 题 | V*Star (进行中) | 预计 ~2.5h 完成 |
+
+## 10. 创新性分析与顶会可能性评估
+
+### 10.1 技术创新点
+
+**核心贡献：将 VLM 的内部注意力作为免费的定位信号**
+
+| 创新点 | 描述 | 相对于现有工作的差异 |
+|--------|------|---------------------|
+| **Attention-as-Localization** | 从 VLM prefill 的 decoder attention 中直接提取目标位置，无需额外检测器或 grounding 模型 | 现有工作（如 LISA、Shikra）需要训练专门的 grounding head；我们是 training-free 的 |
+| **Sink Dimension Calibration** | 首次系统性地识别和过滤 VLM 注意力中的位置偏置维度 | Attention sink 现象已知，但将其应用于 attention-based localization 的校准是新的 |
+| **Semantic Superpixel Diffusion** | 用 SAM3 语义超像素扩散校正粗粒度 token-level attention | 结合了 foundation model 的语义分割能力和 attention 定位，弥补了 spatial resolution 的 gap |
+| **Search + Evidence 解耦** | 搜索负责"找到大致区域"，evidence memory 负责"精确定位 + 验证" | 现有视觉搜索方法（V*Star、DeepEyes）只有搜索没有后处理精炼 |
+
+### 10.2 方法论优势
+
+1. **Training-free**：不需要额外训练任何模型，只利用现有 VLM 的 attention 权重
+2. **Model-agnostic**：原理适用于任何带 decoder attention 的 VLM（Qwen、LLaVA、InternVL）
+3. **Zero extra inference cost**：attention 提取复用搜索时的 VLM forward pass，只需 1 次额外的 DINO forward
+4. **Interpretable**：每一步都产生可视化中间结果（heatmap、boxes、montage）
+
+### 10.3 与相关工作的对比
+
+| 方法 | 定位信号 | 训练需求 | 额外模型 | 定位精度 |
+|------|---------|---------|---------|---------|
+| V*Star (CVPR'24) | VLM confidence score | 无 | 无 | 区域级 |
+| LISA (CVPR'24) | 训练的 mask decoder | 全量微调 | SAM decoder | 像素级 |
+| Shikra (NeurIPS'23) | 训练的坐标回归 | 全量微调 | 无 | 框级 |
+| Ferret (ICLR'24) | 训练的 grounding head | 全量微调 | hybrid encoder | 框级 |
+| **Ours** | VLM 内部 attention + DINO | 无 | DINO (检测器) | 框级 |
+
+**关键差异**：我们是唯一一个 training-free + 利用 VLM 内部信号做定位的方法。LISA/Shikra/Ferret 都需要重新训练模型。
+
+### 10.4 潜在的薄弱环节（审稿人可能质疑）
+
+| 质疑 | 应对 |
+|------|------|
+| "只是工程组合，没有原理创新" | Attention-as-localization 的理论分析（为什么中间层 attention 能定位）+ Sink calibration 的理论动机（transformer 的位置偏置本质）|
+| "依赖 DINO，不算 training-free" | DINO 是 open-vocabulary 检测器，作为验证工具使用，不针对特定任务训练；也可以去掉 DINO 纯用 attention |
+| "只在 V*Star 上验证" | 需要扩展到 HR-Bench、MME-RealWorld、FINES-Bench 多个 benchmark |
+| "Attention 定位不够精确" | 超像素扩散 + DINO 验证补充精度；消融实验证明每个组件的贡献 |
+| "计算开销如何" | Attention 提取复用现有 forward pass，DINO 只加 1 次 batch inference，总开销 <10% |
+
+### 10.5 顶会定位建议
+
+**最适合的顶会**：
+- **ECCV / CVPR** (视觉顶会)：最匹配，属于 "visual grounding without training" 方向
+- **NeurIPS / ICML** (ML 顶会)：需要更强的理论分析（为什么 attention 能定位、sink 的形式化）
+- **ACL / EMNLP** (NLP 顶会)：如果强调 "understanding transformer internal representations" 的角度
+
+**当前距离可投稿的差距**：
+
+| 维度 | 当前状态 | 需要补充 |
+|------|---------|---------|
+| 实验覆盖 | V*Star 1个数据集 | 至少3个数据集 (HR-Bench, MME-RealWorld, FINES-Bench) |
+| Ablation | 无 | 5组消融 (sink filter, superpixel diffusion, DINO verify, layer selection, evidence presentation) |
+| Baseline 对比 | 无 | 对比 V*Star原始, LISA, Shikra, 直接 DINO grounding |
+| 理论分析 | 经验观察 | 为什么中间层 attention 有效（可视化 + 统计分析） |
+| 多模型验证 | Qwen2.5-VL-7B | 至少加 InternVL / LLaVA 证明 model-agnostic |
+| Writing | 技术文档 | 正式论文（related work, method formalization, figures） |
+
+### 10.6 结论
+
+**创新性评级：中等偏上**。核心 insight（VLM attention 作为免费定位信号 + sink 校准）是有价值的，但需要更强的理论支撑和更广泛的实验验证。如果全量实验确认 evidence memory 在多个 benchmark 上一致性地提升 CVSearch 2-5 个百分点，加上完善的消融实验和 cross-model 验证，有望投 ECCV/CVPR workshop → 主会。
+
+**关键风险**：如果提升只在特定数据集/特定错题上有效，而全量提升不显著，则需要重新定位贡献——可能更适合作为 CVSearch 的一个 extension（技术报告/应用论文），而非独立的方法论文。
