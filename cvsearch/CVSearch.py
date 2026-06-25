@@ -119,13 +119,14 @@ def get_cvsearch_response(
             if sum(sam_success_flags) == len(text_target):
                 # sam3 segment all target objects
                 fast_node = []
-                for search_box in sam_bboxes:
+                for search_box, t_target in zip(sam_bboxes, text_target):
                     x0, y0 = search_box[0], search_box[1]
                     w, h = search_box[2] - search_box[0], search_box[3] - search_box[1]
                     bbox_xywh = [x0, y0, w, h]
                     state = NodeState(image_pil, bbox_xywh)
                     node = NodeA(state)
                     node.search_source = "fast"
+                    node.target_phrase = t_target
                     fast_node.append(node)
 
                 # print("Fast Search Success!")
@@ -171,6 +172,7 @@ def get_cvsearch_response(
                         state = NodeState(image_pil, bbox_xywh)
                         node = NodeA(state)
                         node.search_source = "fast"
+                        node.target_phrase = t_target
                         zoom_node.append(node)
                         num_pop.append(1)
                         annotation['sam'].append(True)
@@ -198,6 +200,7 @@ def get_cvsearch_response(
                             #Search successfully
                             for cand in candidates_search:
                                 cand.search_source = "fine"
+                                cand.target_phrase = t_target
 
                             zoom_node.extend(candidates_search)
                             # print("Fine Search Success!")
@@ -207,6 +210,7 @@ def get_cvsearch_response(
                                 best_candidate = candidates_search[0]  # first Node
                                 if not search_mode:
                                     best_candidate.search_source = "fine_fallback"
+                                    best_candidate.target_phrase = t_target
                                     zoom_node.append(best_candidate)
                                     # print("Fine Search Fail!")
                                 else:
@@ -250,6 +254,7 @@ def get_cvsearch_response(
                                                 state = NodeState(image_pil, bbox_xywh)
                                                 node = NodeA(state)
                                                 node.search_source = "fast"
+                                                node.target_phrase = t_target
                                                 fast_node.append(node)
 
                                             # print("Second Fast Search Success!")
@@ -295,10 +300,12 @@ def get_cvsearch_response(
                                                 state = NodeState(image_pil, bbox_shifted)
                                                 node = NodeA(state)
                                                 node.search_source = "fine"
+                                                node.target_phrase = t_target
                                                 zoom_node.append(node)
                                                 # print("Second Fine Search Success!")
                                             else:
                                                 best_candidate.search_source = "fine_fallback"
+                                                best_candidate.target_phrase = t_target
                                                 zoom_node.append(best_candidate)
                                                 # print("Fine Search Fail!")
 
@@ -318,13 +325,14 @@ def get_cvsearch_response(
             # MLLM extraction failed, rule matches target objects
             if sum(sam_success_flags) == len(text_target):
                 fast_node = []
-                for search_box in sam_bboxes:
+                for search_box, t_target in zip(sam_bboxes, text_target):
                     x0, y0 = search_box[0], search_box[1]
                     w, h = search_box[2] - search_box[0], search_box[3] - search_box[1]
                     bbox_xywh = [x0, y0, w, h]
                     state = NodeState(image_pil, bbox_xywh)
                     node = NodeA(state)
                     node.search_source = "fast"
+                    node.target_phrase = t_target
                     fast_node.append(node)
 
                 # print("Fast Search Success!")
@@ -368,6 +376,7 @@ def get_cvsearch_response(
                         state = NodeState(image_pil, bbox_xywh)
                         node = NodeA(state)
                         node.search_source = "fast"
+                        node.target_phrase = t_target
                         zoom_node.append(node)
                         num_pop.append(1)
                         annotation['sam'].append(True)
@@ -400,6 +409,7 @@ def get_cvsearch_response(
                                 best_candidate = candidates_search[0]
                                 if not search_mode:
                                     best_candidate.search_source = "fine_fallback"
+                                    best_candidate.target_phrase = t_target
                                     zoom_node.append(best_candidate)
                                     # print("Fine Search Fail!")
                                 else:
@@ -443,6 +453,7 @@ def get_cvsearch_response(
                                                 state = NodeState(image_pil, bbox_xywh)
                                                 node = NodeA(state)
                                                 node.search_source = "fast"
+                                                node.target_phrase = t_target
                                                 fast_node.append(node)
 
                                             # print("Second Fast Search Success!")
@@ -489,10 +500,12 @@ def get_cvsearch_response(
                                                 state = NodeState(image_pil, bbox_shifted)
                                                 node = NodeA(state)
                                                 node.search_source = "fine"
+                                                node.target_phrase = t_target
                                                 zoom_node.append(node)
                                                 # print("Second Fine Search Success!")
                                             else:
                                                 best_candidate.search_source = "fine_fallback"
+                                                best_candidate.target_phrase = t_target
                                                 zoom_node.append(best_candidate)
                                                 # print("Fine Search Fail!")
 
@@ -588,7 +601,14 @@ def _compile_evidence(evidence_compiler, image_pil, question, searched_nodes, an
     for index, node in enumerate(searched_nodes):
         if getattr(node, "is_root", False):
             continue
-        target = targets[min(index, len(targets) - 1)]
+        # Use node.target_phrase set by CVSearch, fallback to index-based mapping
+        node_phrase = getattr(node, "target_phrase", None)
+        if node_phrase:
+            target = next((t for t in targets if t.phrase == node_phrase), None)
+            if target is None:
+                target = TargetSpec(target_id=f"target_{node_phrase}", phrase=node_phrase)
+        else:
+            target = targets[min(index, len(targets) - 1)]
         proposals.append(
             EvidenceProposal(
                 target=target,
