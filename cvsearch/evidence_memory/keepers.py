@@ -804,6 +804,7 @@ class BatchScoreRankingKeeper:
             # Batch DINO verify all candidates.
             dino_scores: dict[str, float] = {}
             dino_has_box: dict[str, bool] = {}
+            dino_evidence_boxes: dict[str, BoxXYWH] = {}
             if candidates:
                 verification_results = self.verifier.verify(
                     image,
@@ -816,6 +817,23 @@ class BatchScoreRankingKeeper:
                     has_box = score > 0.0
                     dino_scores[w.source_id] = score
                     dino_has_box[w.source_id] = has_box
+                    # Map DINO's best box back to original image coordinates.
+                    if has_box and vr.metadata:
+                        boxes_xyxy = vr.metadata.get("boxes_xyxy", [])
+                        region_box = vr.metadata.get("region_box")
+                        if boxes_xyxy and region_box:
+                            # Best box (highest score) in crop-local xyxy pixels
+                            best_box_xyxy = boxes_xyxy[0]
+                            rx, ry, rw, rh = [float(v) for v in region_box]
+                            bx1, by1, bx2, by2 = [float(v) for v in best_box_xyxy]
+                            # DINO outputs pixel coords relative to crop.
+                            # region_box is xywh in original image coords.
+                            # Crop image has size (rw, rh) so direct offset:
+                            orig_x = rx + bx1
+                            orig_y = ry + by1
+                            orig_w = bx2 - bx1
+                            orig_h = by2 - by1
+                            dino_evidence_boxes[w.source_id] = (orig_x, orig_y, orig_w, orig_h)
 
             # Scoring: DINO-first ranking.
             # Windows with DINO box rank by dino_score (higher = better).
@@ -850,7 +868,11 @@ class BatchScoreRankingKeeper:
 
             # Build EvidenceItem objects.
             for combined_score, w in selected:
-                evidence_box = clip_box(w.attention_box or w.window_box, image_size)
+                # Use DINO's detected box if available; otherwise fall back to attention_box.
+                if w.source_id in dino_evidence_boxes:
+                    evidence_box = clip_box(dino_evidence_boxes[w.source_id], image_size)
+                else:
+                    evidence_box = clip_box(w.attention_box or w.window_box, image_size)
                 if box_area(evidence_box) < 1.0:
                     continue
                 attn_peak = float(w.metadata.get("attention_peak_score", 0.0))
