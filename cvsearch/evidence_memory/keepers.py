@@ -727,32 +727,26 @@ def draw_xywh(draw: Any, box: BoxXYWH, color: tuple[int, int, int], *, width: in
 class BatchScoringConfig:
     """Scoring and retention parameters for BatchScoreRankingKeeper."""
 
-    alpha: float = 1.0
-    """Weight for attention peak score."""
-    beta: float = 1.5
-    """Weight for DINO verification score."""
-    gamma: float = 0.3
-    """Weight for normalised area ratio."""
     top_k_per_target: int = 3
     """Maximum evidence items retained per target."""
     min_per_target: int = 1
     """Minimum evidence items retained per target (guaranteed)."""
     nms_iou_threshold: float = 0.7
     """IoU threshold for per-target NMS deduplication."""
-    min_attn_threshold: float = 0.1
-    """Minimum attention peak score; windows below this skip DINO verification."""
+    min_attn_threshold: float = 0.0
+    """Minimum attention peak score for pre-filtering (0 = no filter, send all to DINO)."""
 
 
 @dataclass
 class BatchScoreRankingKeeper:
-    """Keeper that ranks leaf-batch windows with a combined attention+DINO score.
+    """Keeper that ranks leaf-batch windows purely by DINO verification score.
 
     Flow per target:
-    1. Filter windows by ``min_attn_threshold`` on ``attention_peak_score``.
-    2. Batch-verify survivors with ``GroundingDINOBoxVerifier``.
-    3. Compute ``combined_score = alpha*attn + beta*dino + gamma*area_ratio``.
-    4. Sort descending; apply NMS at ``nms_iou_threshold``; keep top-K.
-    5. Guarantee ``min_per_target`` items by relaxing score filter if needed.
+    1. Send all windows to ``GroundingDINOBoxVerifier`` for batch verification.
+    2. Rank by DINO score: windows with detected box rank by confidence (higher first);
+       windows without DINO detection are ranked last.
+    3. Apply NMS at ``nms_iou_threshold``; keep top-K per target.
+    4. Guarantee ``min_per_target`` items by relaxing filter if needed.
     """
 
     verifier: Any  # GroundingDINOBoxVerifier
@@ -807,8 +801,9 @@ class BatchScoreRankingKeeper:
                 else:
                     low_attn.append(w)
 
-            # Batch DINO verify candidates.
+            # Batch DINO verify all candidates.
             dino_scores: dict[str, float] = {}
+            dino_has_box: dict[str, bool] = {}
             if candidates:
                 verification_results = self.verifier.verify(
                     image,
@@ -817,20 +812,22 @@ class BatchScoreRankingKeeper:
                     context=context,
                 )
                 for w, vr in zip(candidates, verification_results):
-                    dino_scores[w.source_id] = float(vr.score or 0.0)
+                    score = float(vr.score or 0.0)
+                    has_box = score > 0.0
+                    dino_scores[w.source_id] = score
+                    dino_has_box[w.source_id] = has_box
 
-            # Combined scoring for all clipped windows.
+            # Scoring: DINO-first ranking.
+            # Windows with DINO box rank by dino_score (higher = better).
+            # Windows without DINO box are ranked last (score = -1).
             scored: list[tuple[float, EvidenceWindow]] = []
             for w in clipped:
-                attn_score = float(w.metadata.get("attention_peak_score", 0.0))
+                has_box = dino_has_box.get(w.source_id, False)
                 dino_score = dino_scores.get(w.source_id, 0.0)
-                area = box_area(w.window_box)
-                area_ratio = min(1.0, area / image_area)
-                combined = (
-                    self.config.alpha * attn_score
-                    + self.config.beta * dino_score
-                    + self.config.gamma * area_ratio
-                )
+                if has_box:
+                    combined = dino_score
+                else:
+                    combined = -1.0
                 scored.append((combined, w))
 
             # Sort descending by combined score.
