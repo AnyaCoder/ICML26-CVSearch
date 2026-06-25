@@ -659,6 +659,155 @@ def _compile_evidence(evidence_compiler, image_pil, question, searched_nodes, an
     return None
 
 
+def get_cvsearch_leaf_batch_response(
+        sam_model,
+        zoom_model,
+        nlp_model,
+        annotation,
+        ic_examples,
+        decomposed_question_template,
+        answering_confidence_threshold_upper,
+        answering_confidence_threshold_lower,
+        fast_threshold,
+        pop_limit,
+        threshold_descrease,
+        image_folder: str = None,
+        debug_recorder=None,
+        evidence_compiler=None,
+        leaf_depth_range: tuple = (1, 3),
+):
+    """Leaf-batch evidence pipeline: build the search tree, collect all leaf
+    nodes as proposals, and run evidence_compiler without recursive search.
+
+    The existing ``get_cvsearch_response`` is unchanged.  This entry point
+    replaces the ``semantic_guide_search`` step entirely — the tree provides
+    spatial decomposition and evidence_compiler handles selection.
+    """
+    from cvsearch.evidence_memory import EvidenceProposal, TargetSpec
+    from cvsearch.evidence_memory.leaf_collector import collect_leaf_proposals
+
+    keep_threshold_mllm_primary = 0.15
+    tree_depth = 3
+
+    input_image = annotation['input_image']
+    if image_folder is not None:
+        input_image = os.path.join(image_folder, input_image)
+    image_pil = Image.open(input_image).convert('RGB')
+    if debug_recorder is not None:
+        debug_recorder.start_sample(annotation, image_pil, input_image)
+
+    question = annotation['question']
+    options = annotation.get('options', None)
+    answer_type = annotation.get('answer_type', 'option_single')
+
+    # Build feature-map and search tree (same as get_cvsearch_response).
+    with torch.inference_mode():
+        backbone_out, processed_results, target_id = sam_model.batch_inference(
+            image_pil, ["target"]
+        )
+    image_features_batch = backbone_out['vision_features']
+    if isinstance(image_features_batch, torch.Tensor):
+        feat = image_features_batch.detach().cpu().float().numpy()
+    else:
+        feat = image_features_batch
+    feat = feat.squeeze(0)
+    del backbone_out, image_features_batch
+
+    builder = ConstrainedTreeBuilder(
+        feat, n_atoms=600, pos_weight=3.5, split_threshold=0.3,
+        keep_threshold=keep_threshold_mllm_primary,
+    )
+    tree_dict = builder.build_tree(max_depth=tree_depth, min_splits=4, max_splits=8)
+    feat_shape = feat.shape
+    image_tree = AdaptiveImageTree(image_pil, tree_dict, feat_shape)
+    if debug_recorder is not None:
+        debug_recorder.record_tree("leaf_batch_tree", image_tree)
+
+    # Build target list from annotation.
+    targets_text = annotation.get('targets', []) or []
+    if not targets_text:
+        # Fall back to NLP extraction mirroring get_cvsearch_response.
+        targets_text = extract_visual_objects(nlp_model, question) or []
+    targets = [TargetSpec(target_id=f"target_{i}", phrase=t) for i, t in enumerate(targets_text)]
+    if not targets:
+        targets = [TargetSpec(target_id="target_0", phrase="target")]
+
+    # Collect leaf proposals — no recursive search needed.
+    proposals = collect_leaf_proposals(image_tree, targets, depth_range=leaf_depth_range)
+
+    if not proposals or evidence_compiler is None:
+        # Graceful fallback: answer from the full image with no evidence.
+        img_w, img_h = image_pil.size
+        state = NodeState(image_pil, [0, 0, img_w, img_h])
+        root_node = NodeA(state)
+        root_node.is_root = True
+        question_input = format_question_new(question, options)
+        response = zoom_model.free_form_using_nodes(image_pil, question_input, [root_node])
+        if debug_recorder is not None:
+            debug_recorder.record_final(annotation, image_pil, [], response)
+        return response
+
+    # Build evidence context.
+    context = {"question": question, "annotation": annotation}
+    if debug_recorder is not None:
+        sample_dir = getattr(debug_recorder, "sample_dir", None) or getattr(debug_recorder, "output_dir", None)
+        if sample_dir:
+            from pathlib import Path as _Path
+            from cvsearch.debug.artifacts import ArtifactStore
+            sample_dir = _Path(sample_dir)
+            context["artifact_store"] = ArtifactStore(sample_dir)
+            context["evidence_montage_path"] = str(sample_dir / "12_evidence_memory_montage.jpg")
+            context["evidence_model_input_path"] = str(sample_dir / "12_evidence_model_input.jpg")
+
+    # Compile evidence (window building + keeping + layout).
+    artifact = evidence_compiler.compile(
+        image_pil,
+        question,
+        proposals=proposals,
+        targets=targets,
+        context=context,
+    )
+
+    # Use the montage image if available; otherwise fall back to full image.
+    evidence_image = None
+    if artifact.montage and artifact.montage.model_input_path:
+        try:
+            evidence_image = Image.open(artifact.montage.model_input_path).convert("RGB")
+        except Exception:
+            pass
+
+    final_image = evidence_image if evidence_image is not None else image_pil
+    img_w, img_h = image_pil.size
+    state = NodeState(image_pil, [0, 0, img_w, img_h])
+    root_node = NodeA(state)
+    root_node.is_root = True
+    final_nodes = [] if evidence_image is not None else [root_node]
+
+    answer_type = annotation.get('answer_type', 'free_form')
+    if answer_type == "logits_match":
+        response = zoom_model.multiple_choices_inference(final_image, question, options, final_nodes)
+    elif answer_type == "free_form":
+        response = zoom_model.free_form_using_nodes(final_image, question, final_nodes)
+    elif answer_type == "option_list":
+        answers = []
+        for option_str in options:
+            question_input = format_question(question, option_str)
+            answers.append(zoom_model.free_form_using_nodes(final_image, question_input, final_nodes))
+        response = answers
+    elif answer_type == "Multiple Choice":
+        question_input = format_question_multichoice(question, options)
+        response = zoom_model.free_form_using_nodes(final_image, question_input, final_nodes)
+    elif answer_type == "option_single":
+        question_input = format_question_new(question, options)
+        response = zoom_model.free_form_using_nodes(final_image, question_input, final_nodes)
+    else:
+        raise NotImplementedError(f"Unsupported answer_type: {answer_type}")
+
+    if debug_recorder is not None:
+        debug_recorder.record_final(annotation, image_pil, [], response)
+    return response
+
+
 def process_sam_result(processed_results, target_id, is_second_search):
     """
     process SAM result

@@ -723,8 +723,185 @@ def draw_xywh(draw: Any, box: BoxXYWH, color: tuple[int, int, int], *, width: in
     draw.rectangle([x, y, x + w, y + h], outline=color, width=width)
 
 
+@dataclass(frozen=True)
+class BatchScoringConfig:
+    """Scoring and retention parameters for BatchScoreRankingKeeper."""
+
+    alpha: float = 1.0
+    """Weight for attention peak score."""
+    beta: float = 1.5
+    """Weight for DINO verification score."""
+    gamma: float = 0.3
+    """Weight for normalised area ratio."""
+    top_k_per_target: int = 3
+    """Maximum evidence items retained per target."""
+    min_per_target: int = 1
+    """Minimum evidence items retained per target (guaranteed)."""
+    nms_iou_threshold: float = 0.7
+    """IoU threshold for per-target NMS deduplication."""
+    min_attn_threshold: float = 0.1
+    """Minimum attention peak score; windows below this skip DINO verification."""
+
+
+@dataclass
+class BatchScoreRankingKeeper:
+    """Keeper that ranks leaf-batch windows with a combined attention+DINO score.
+
+    Flow per target:
+    1. Filter windows by ``min_attn_threshold`` on ``attention_peak_score``.
+    2. Batch-verify survivors with ``GroundingDINOBoxVerifier``.
+    3. Compute ``combined_score = alpha*attn + beta*dino + gamma*area_ratio``.
+    4. Sort descending; apply NMS at ``nms_iou_threshold``; keep top-K.
+    5. Guarantee ``min_per_target`` items by relaxing score filter if needed.
+    """
+
+    verifier: Any  # GroundingDINOBoxVerifier
+    config: BatchScoringConfig = field(default_factory=BatchScoringConfig)
+    name: str = "batch_score_ranking_keeper"
+
+    def retain(
+        self,
+        image: Any,
+        windows: Sequence[EvidenceWindow],
+        *,
+        question: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> list["EvidenceItem"]:
+        from .interfaces import EvidenceItem
+
+        if not windows:
+            return []
+
+        image_size = infer_image_size(image)
+        image_area = max(1.0, image_size[0] * image_size[1])
+
+        # Group windows by target.
+        grouped: dict[str, list[EvidenceWindow]] = {}
+        for window in windows:
+            tid = window.target.target_id
+            grouped.setdefault(tid, []).append(window)
+
+        all_items: list[EvidenceItem] = []
+
+        for _tid, target_windows in grouped.items():
+            # Clip window boxes to image bounds.
+            clipped: list[EvidenceWindow] = []
+            for w in target_windows:
+                wb = clip_box(w.window_box, image_size)
+                if box_area(wb) < 1.0:
+                    continue
+                clipped.append(
+                    _replace_window_box(w, wb)
+                )
+
+            if not clipped:
+                continue
+
+            # Split into candidates (above attn threshold) and low-attn.
+            candidates: list[EvidenceWindow] = []
+            low_attn: list[EvidenceWindow] = []
+            for w in clipped:
+                peak = float(w.metadata.get("attention_peak_score", 0.0))
+                if peak >= self.config.min_attn_threshold:
+                    candidates.append(w)
+                else:
+                    low_attn.append(w)
+
+            # Batch DINO verify candidates.
+            dino_scores: dict[str, float] = {}
+            if candidates:
+                verification_results = self.verifier.verify(
+                    image,
+                    candidates,
+                    question=question,
+                    context=context,
+                )
+                for w, vr in zip(candidates, verification_results):
+                    dino_scores[w.source_id] = float(vr.score or 0.0)
+
+            # Combined scoring for all clipped windows.
+            scored: list[tuple[float, EvidenceWindow]] = []
+            for w in clipped:
+                attn_score = float(w.metadata.get("attention_peak_score", 0.0))
+                dino_score = dino_scores.get(w.source_id, 0.0)
+                area = box_area(w.window_box)
+                area_ratio = min(1.0, area / image_area)
+                combined = (
+                    self.config.alpha * attn_score
+                    + self.config.beta * dino_score
+                    + self.config.gamma * area_ratio
+                )
+                scored.append((combined, w))
+
+            # Sort descending by combined score.
+            scored.sort(key=lambda pair: pair[0], reverse=True)
+
+            # Per-target NMS.
+            selected: list[tuple[float, EvidenceWindow]] = []
+            for combined, w in scored:
+                suppress = False
+                for _sc, kept in selected:
+                    if box_iou(w.window_box, kept.window_box) > self.config.nms_iou_threshold:
+                        suppress = True
+                        break
+                if not suppress:
+                    selected.append((combined, w))
+
+            # Top-K; guarantee min_per_target by keeping at least 1 regardless.
+            top_k = max(self.config.min_per_target, self.config.top_k_per_target)
+            selected = selected[:top_k]
+
+            # Build EvidenceItem objects.
+            for combined_score, w in selected:
+                evidence_box = clip_box(w.attention_box or w.window_box, image_size)
+                if box_area(evidence_box) < 1.0:
+                    continue
+                attn_peak = float(w.metadata.get("attention_peak_score", 0.0))
+                dino_score = dino_scores.get(w.source_id, 0.0)
+                item = EvidenceItem(
+                    target=w.target,
+                    source_name=w.source_name,
+                    source_id=w.source_id,
+                    proposal_box=w.proposal_box,
+                    window_box=w.window_box,
+                    evidence_box=evidence_box,
+                    score=combined_score,
+                    vlm_score=attn_peak,
+                    grounding_score=dino_score if dino_score > 0.0 else None,
+                    refinement="grounded" if dino_score > 0.0 else "none",
+                    metadata={
+                        **dict(w.metadata),
+                        "keeper": self.name,
+                        "combined_score": combined_score,
+                        "attention_peak_score": attn_peak,
+                        "dino_score": dino_score,
+                    },
+                )
+                record_evidence_item(image, item, context, stage="11_batch_score_keeper")
+                all_items.append(item)
+
+        return all_items
+
+
+def _replace_window_box(window: EvidenceWindow, new_box: "BoxXYWH") -> EvidenceWindow:
+    """Return a copy of *window* with ``window_box`` replaced by *new_box*."""
+    from .interfaces import EvidenceWindow as _EW
+    return _EW(
+        target=window.target,
+        source_name=window.source_name,
+        source_id=window.source_id,
+        proposal_box=window.proposal_box,
+        window_box=new_box,
+        proposal_score=window.proposal_score,
+        attention_box=window.attention_box,
+        metadata=window.metadata,
+    )
+
+
 __all__ = [
     "AttentionBoxGrounder",
+    "BatchScoreRankingKeeper",
+    "BatchScoringConfig",
     "CVSearchVLMVerifier",
     "EvidenceGrounder",
     "EvidenceRetentionConfig",

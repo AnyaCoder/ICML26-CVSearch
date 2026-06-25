@@ -909,13 +909,147 @@ def draw_xywh(draw: Any, box: BoxXYWH, color: tuple[int, int, int], *, width: in
     draw.rectangle([x, y, x + w, y + h], outline=color, width=width)
 
 
+def compute_attention_peak_score(heatmap: Any) -> float:
+    """Measure attention concentration × coverage.
+
+    Returns ``concentration * coverage`` where:
+    - ``concentration = max / mean`` of the raw heatmap
+    - ``coverage = fraction of normalised pixels above 0.3 threshold``
+    """
+    import numpy as np
+
+    arr = np.asarray(heatmap, dtype=np.float32)
+    if arr.max() == 0:
+        return 0.0
+    normalized = arr / arr.max()
+    coverage = float((normalized > 0.3).sum()) / max(1, int(normalized.size))
+    concentration = float(arr.max()) / (float(arr.mean()) + 1e-8)
+    return float(concentration * coverage)
+
+
+@dataclass
+class LeafBatchWindowBuilder:
+    """Window builder that processes AdaptiveImageTree leaf proposals in batches.
+
+    For each bucket produced by the token-budget scheduler, this builder:
+    1. Wraps proposals as ``EvidenceWindow`` objects.
+    2. Calls ``build_attention_maps`` (which handles internal batching).
+    3. Applies SAM3 superpixel diffusion via ``select_focused_attention``.
+    4. Stores ``attention_peak_score`` and ``attention_box`` in window metadata.
+    5. Drops windows where attention cannot produce a valid box.
+    """
+
+    attention_provider: AttentionMapProvider
+    config: WindowBuilderConfig = field(default_factory=WindowBuilderConfig)
+    name: str = "leaf_batch_window"
+
+    def build(
+        self,
+        image: Any,
+        question: str,
+        *,
+        proposals: Sequence[EvidenceProposal],
+        targets=None,
+        context: Mapping[str, Any] | None = None,
+    ) -> list[EvidenceWindow]:
+        if not proposals:
+            return []
+
+        size = infer_image_size(image, context)
+
+        # Build analysis windows from proposals (window_box == clipped proposal box).
+        analysis_windows: list[EvidenceWindow] = []
+        for proposal in proposals:
+            clipped = clip_box(proposal.box, size)
+            analysis_windows.append(
+                EvidenceWindow(
+                    target=proposal.target,
+                    source_name=proposal.source_name,
+                    source_id=proposal.source_id,
+                    proposal_box=clipped,
+                    window_box=clipped,
+                    proposal_score=proposal.score,
+                    metadata={
+                        **dict(proposal.metadata),
+                        "window_builder": self.name,
+                        "window_policy": "leaf_batch_attention",
+                        "bbox_extraction_method": "attention_superpixel_diffusion",
+                        "bbox_extraction_beta": self.config.moment_beta,
+                    },
+                )
+            )
+
+        # Batch attention extraction — provider handles internal token-bucketing.
+        attention_maps = build_attention_maps(
+            self.attention_provider,
+            image,
+            question,
+            analysis_windows,
+            context=context,
+        )
+
+        windows: list[EvidenceWindow] = []
+        for analysis_window, attention_map in zip(analysis_windows, attention_maps, strict=True):
+            analysis_box = tuple(float(v) for v in analysis_window.window_box)
+            analysis_image = crop_analysis_image(image, analysis_box)
+
+            focus = select_focused_attention(
+                attention_map,
+                analysis_box,
+                size,
+                config=self.config,
+                analysis_image=analysis_image,
+                context=context,
+            )
+            attention_box = focus.box if focus is not None else None
+            if attention_box is None:
+                # No valid attention — drop this proposal per design principles.
+                continue
+
+            # Compute peak score from the raw heatmap values.
+            peak_score = 0.0
+            if attention_map is not None:
+                import numpy as np
+                raw = np.asarray(attention_map.values, dtype=np.float32)
+                peak_score = compute_attention_peak_score(raw)
+
+            window = replace_window(
+                analysis_window,
+                window_box=attention_box,
+                attention_box=attention_box,
+                metadata={
+                    **dict(analysis_window.metadata),
+                    "attention_provider": self.attention_provider.name,
+                    "attention_status": "used",
+                    "analysis_box": analysis_box,
+                    "attention_peak_score": peak_score,
+                    "bbox_extraction_method": focus.method,
+                    "attention_metadata": attention_map.metadata if attention_map else {},
+                },
+            )
+            windows.append(window)
+            record_window_metadata([window], context, stage="10_leaf_batch_window_builder")
+            record_attention_artifacts(
+                image,
+                window,
+                attention_map,
+                context,
+                stage="10_leaf_batch_window_builder",
+                display_values=focus.values if focus is not None else None,
+            )
+
+        return windows
+
+
 __all__ = [
     "AttentionGuidedWindowBuilder",
+    "LeafBatchWindowBuilder",
     "FocusedAttention",
     "AttentionMap",
     "AttentionMapProvider",
     "Heatmap",
     "WindowBuilderConfig",
+    "compute_attention_peak_score",
     "box_area",
     "box_iou",
     "build_attention_maps",
