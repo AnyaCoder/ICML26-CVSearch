@@ -44,6 +44,7 @@ def get_cvsearch_response(
     options = annotation.get('options', None)
     question_free_form = None
     searched_nodes = []
+    semantic_superpixel_sources = []
     ####Quick assessment
     img_w, img_h = image_pil.size
     state = NodeState(image_pil, [0, 0, img_w, img_h])
@@ -159,6 +160,12 @@ def get_cvsearch_response(
                 tree_dict = builder.build_tree(max_depth=tree_depth, min_splits=4, max_splits=8)
                 feat_shape = feat.shape
                 image_tree = AdaptiveImageTree(image_pil, tree_dict, feat_shape)
+                semantic_superpixel_sources.append({
+                    "labels": builder.atom_labels,
+                    "features": builder.atom_features,
+                    "image_box": (0, 0, img_w, img_h),
+                    "semantic_feature_dim": builder.C,
+                })
                 if debug_recorder is not None:
                     debug_recorder.record_tree("primary_tree", image_tree)
                     debug_recorder.record_tree_boundaries("primary_tree", image_pil, builder, tree_dict)
@@ -528,7 +535,8 @@ def get_cvsearch_response(
         print(f"[EvidenceMemory] compiler present, {len(searched_nodes)} nodes, calling _compile_evidence...")
         try:
             evidence_image = _compile_evidence(
-                evidence_compiler, image_pil, question, searched_nodes, annotation, debug_recorder
+                evidence_compiler, image_pil, question, searched_nodes, annotation, debug_recorder,
+                semantic_superpixel_sources=semantic_superpixel_sources,
             )
             print(f"[EvidenceMemory] result: {'montage loaded' if evidence_image else 'None (no montage)'}")
         except Exception as e:
@@ -586,7 +594,8 @@ def get_cvsearch_response(
         raise NotImplementedError
 
 
-def _compile_evidence(evidence_compiler, image_pil, question, searched_nodes, annotation, debug_recorder):
+def _compile_evidence(evidence_compiler, image_pil, question, searched_nodes, annotation, debug_recorder,
+                      semantic_superpixel_sources=None):
     """Build evidence proposals from searched_nodes and compile via evidence_compiler."""
     from cvsearch.evidence_memory import EvidenceProposal, TargetSpec
 
@@ -629,6 +638,8 @@ def _compile_evidence(evidence_compiler, image_pil, question, searched_nodes, an
 
     # Build context with debug info
     context = {"question": question, "annotation": annotation}
+    if semantic_superpixel_sources:
+        context["semantic_superpixel_sources"] = semantic_superpixel_sources
     if debug_recorder is not None:
         sample_dir = getattr(debug_recorder, "sample_dir", None) or getattr(debug_recorder, "output_dir", None)
         if sample_dir:
