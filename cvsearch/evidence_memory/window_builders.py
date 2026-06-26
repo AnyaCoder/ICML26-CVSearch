@@ -230,13 +230,14 @@ def select_focused_attention(
         return None
     if analysis_image is not None and config.superpixel_diffusion:
         semantic = semantic_superpixels_for_analysis(context, analysis_box, image_size, analysis_image.size)
-        focus = superpixel_diffused_attention(values, analysis_image, config, semantic_superpixels=semantic)
-        if focus is not None:
-            return FocusedAttention(
-                box=crop_box_to_image(focus.box, analysis_box, image_size),
-                values=focus.values,
-                method=focus.method,
-            )
+        if semantic is not None:
+            focus = superpixel_diffused_attention(values, analysis_image, config, semantic_superpixels=semantic)
+            if focus is not None:
+                return FocusedAttention(
+                    box=crop_box_to_image(focus.box, analysis_box, image_size),
+                    values=focus.values,
+                    method=focus.method,
+                )
     clipped_map_box = clip_box(box_in_map, (float(width), float(height)))
     return FocusedAttention(
         box=map_box_to_image(clipped_map_box, (width, height), analysis_box, image_size),

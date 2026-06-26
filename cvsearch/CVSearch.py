@@ -638,6 +638,12 @@ def _compile_evidence(evidence_compiler, image_pil, question, searched_nodes, an
             context["artifact_store"] = ArtifactStore(sample_dir)
             context["evidence_montage_path"] = str(sample_dir / "12_evidence_memory_montage.jpg")
             context["evidence_model_input_path"] = str(sample_dir / "12_evidence_model_input.jpg")
+    else:
+        import tempfile
+        from pathlib import Path as _Path
+        tmp_dir = _Path(tempfile.mkdtemp(prefix="evidence_"))
+        context["evidence_montage_path"] = str(tmp_dir / "montage.jpg")
+        context["evidence_model_input_path"] = str(tmp_dir / "model_input.jpg")
 
     # Compile
     artifact = evidence_compiler.compile(
